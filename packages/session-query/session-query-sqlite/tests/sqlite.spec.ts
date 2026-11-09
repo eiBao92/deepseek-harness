@@ -212,6 +212,63 @@ async function liveContext(config: ConstructorParameters<typeof SqliteSessionQue
 }
 
 describe('SQLite session search', () => {
+  it('filters headers before cold reads and live snapshots', async () => {
+    const allowed = header('allowed', 1, { cwd: '/allowed' })
+    const irrelevant = header('irrelevant', 1, { cwd: '/elsewhere' })
+    TestPersistence.reset([
+      { meta: allowed, events: messageEvents('needle') },
+      { meta: irrelevant, events: messageEvents('private needle') },
+    ])
+    const ctx = await liveContext()
+    await ctx.plugin(TestPersistence)
+    const live = ctx.sessions.create(SessionId('irrelevant-live'), { meta: { cwd: '/elsewhere' } })
+    const snapshot = vi.spyOn(live, 'snapshotEvents').mockImplementation(() => { throw new Error('irrelevant live clone') })
+    const open = vi.spyOn(ctx.sessionPersistence, 'open')
+    open.mockImplementation(async (id, access) => {
+      if (id !== allowed.id) throw new Error('irrelevant cold read')
+      return new TestHandle(id, allowed, access)
+    })
+    const started = performance.now()
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'needle', sessionFilters: [{ kind: 'created-at', from: Date.UTC(2099, 0, 1) }],
+    })).resolves.toEqual({ items: [] })
+    expect(open).not.toHaveBeenCalled()
+    expect(snapshot).not.toHaveBeenCalled()
+    await expect(ctx.sessionQuery.searchSessions({
+      query: 'needle', sessionFilters: [{ kind: 'cwd', values: ['/allowed'] }],
+    })).resolves.toMatchObject({ items: [{ header: allowed }] })
+    expect([...TestPersistence.reads.keys()]).toEqual([allowed.id])
+    expect(snapshot).not.toHaveBeenCalled()
+    console.info('synthetic scoped stages', {
+      elapsedMs: performance.now() - started,
+      headerLists: TestPersistence.listSignals.length,
+      coldReads: [...TestPersistence.reads.values()].reduce((sum, count) => sum + count, 0),
+      irrelevantLiveClones: snapshot.mock.calls.length,
+    })
+    snapshot.mockRestore()
+    open.mockRestore()
+  })
+  it('refreshes changed and deleted durable rows across header scopes', async () => {
+    const first = header('first-scope', 1, { cwd: '/first' })
+    const second = header('second-scope', 1, { cwd: '/second' })
+    TestPersistence.reset([
+      { meta: first, events: messageEvents('needle') },
+      { meta: second, events: messageEvents('needle') },
+    ])
+    const ctx = await liveContext()
+    await ctx.plugin(TestPersistence)
+    const search = (cwd: string) => ctx.sessionQuery.searchSessions({
+      query: 'needle', sessionFilters: [{ kind: 'cwd', values: [cwd] }],
+    })
+    expect((await search('/first')).items.map(item => item.header.id)).toEqual([first.id])
+    TestPersistence.set({ meta: first, events: messageEvents('replaced') })
+    expect((await search('/second')).items.map(item => item.header.id)).toEqual([second.id])
+    expect((await search('/first')).items).toEqual([])
+    TestPersistence.entries.delete(second.id)
+    expect((await search('/first')).items).toEqual([])
+    expect((await search('/second')).items).toEqual([])
+  })
+
   it('defaults and validates opening policy and persisted inspection concurrency through its Cordis config', async () => {
     const defaultCtx = await liveContext()
     expect((defaultCtx.sessionQuery as SqliteSessionQueryEngine).config.openAt).toBe('startup')
