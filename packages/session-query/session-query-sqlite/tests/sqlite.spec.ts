@@ -248,6 +248,79 @@ describe('SQLite session search', () => {
     snapshot.mockRestore()
     open.mockRestore()
   })
+  it('removes an old scoped overlay when the same id has a different live owner', async () => {
+    const ctx = await liveContext()
+    const id = SessionId('reused-scope')
+    const first = ctx.sessions.prepare(id, { seed: messageEvents('needle old'), meta: { cwd: '/first' } })
+    const detach = ctx.sessions.enter(first)
+    ctx.sessions.announce(first)
+    const search = () => ctx.sessionQuery.searchSessions({
+      query: 'needle', sessionFilters: [{ kind: 'cwd', values: ['/first'] }],
+    })
+    expect((await search()).items).toHaveLength(1)
+    detach()
+    ctx.sessions.create(id, { seed: messageEvents('needle new'), meta: { cwd: '/second' } })
+    expect((await search()).items).toEqual([])
+    expect((await ctx.sessionQuery.searchSessions({
+      query: 'needle', sessionFilters: [{ kind: 'cwd', values: ['/second'] }],
+    })).items).toHaveLength(1)
+  })
+
+  it('invalidates global cursors for unrelated live appends without cloning them', async () => {
+    const ctx = await liveContext()
+    const target = ctx.sessions.create(SessionId('scoped-target'), {
+      seed: [...messageEvents('needle one'), { ...messageEvents('needle two')[0]!, seq: SessionSeq(1) }],
+      meta: { cwd: '/selected' },
+    })
+    ctx.sessions.create(SessionId('scoped-peer'), { seed: messageEvents('needle peer'), meta: { cwd: '/selected' } })
+    const other = ctx.sessions.create(SessionId('outside'), { meta: { cwd: '/outside' } })
+    const snapshot = vi.spyOn(other, 'snapshotEvents').mockImplementation(() => { throw new Error('outside clone') })
+    const request = { query: 'needle', limit: 1, sessionFilters: [{ kind: 'cwd' as const, values: ['/selected'] }] }
+    const sessions = await ctx.sessionQuery.searchSessions(request)
+    const events = await ctx.sessionQuery.searchEvents({ sessionId: target.id, query: 'needle', limit: 1 })
+    if (sessions.nextCursor === undefined || events.nextCursor === undefined) throw new Error('expected cursors')
+    other.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'unrelated' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: target.id, query: 'needle', limit: 1, cursor: events.nextCursor,
+    })).resolves.toMatchObject({ items: [{ sessionId: target.id }] })
+    await expect(ctx.sessionQuery.searchSessions({ ...request, cursor: sessions.nextCursor }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    expect(snapshot).not.toHaveBeenCalled()
+    snapshot.mockRestore()
+    target.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'fresh needle' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    await ctx.sessionQuery.searchEvents({ sessionId: other.id, query: 'unrelated' })
+    await expect(ctx.sessionQuery.searchEvents({
+      sessionId: target.id, query: 'needle', limit: 1, cursor: events.nextCursor,
+    })).rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: target.id, query: 'fresh' }))
+      .resolves.toMatchObject({ items: [{ sessionId: target.id, snippet: 'fresh needle' }] })
+  })
+
+  it.each(['append', 'add', 'delete'] as const)('invalidates global cursors for unindexed persisted %s changes', async (change) => {
+    const outside = header('outside-durable', 1, { cwd: '/outside' })
+    TestPersistence.reset([{ meta: outside, events: messageEvents('private') }])
+    const ctx = await liveContext()
+    await ctx.plugin(TestPersistence)
+    for (const id of ['selected-one', 'selected-two']) {
+      ctx.sessions.create(SessionId(id), { seed: messageEvents('needle'), meta: { cwd: '/selected' } })
+    }
+    const request = { query: 'needle', limit: 1, sessionFilters: [{ kind: 'cwd' as const, values: ['/selected'] }] }
+    const page = await ctx.sessionQuery.searchSessions(request)
+    if (page.nextCursor === undefined) throw new Error('expected cursor')
+    if (change === 'delete') TestPersistence.entries.delete(outside.id)
+    else TestPersistence.set({
+      meta: change === 'add' ? header('another-outside', 1, { cwd: '/outside' }) : outside,
+      events: messageEvents('changed private'),
+    })
+    await expect(ctx.sessionQuery.searchSessions({ ...request, cursor: page.nextCursor }))
+      .rejects.toThrow(expectCode('SESSION_QUERY_STALE_CURSOR'))
+    expect(TestPersistence.reads.size).toBe(0)
+  })
+
   it('refreshes changed and deleted durable rows across header scopes', async () => {
     const first = header('first-scope', 1, { cwd: '/first' })
     const second = header('second-scope', 1, { cwd: '/second' })
