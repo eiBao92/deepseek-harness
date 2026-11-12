@@ -23,6 +23,7 @@ import SessionQueryEngine, {
   SessionSearchCursor,
   assertSessionHeadersCompatible,
   buildSessionEventSearchDocuments,
+  filterSessionResults,
   readColdSessionLog,
 } from '@deepseek-ai/dsh-session-query'
 import type {
@@ -36,6 +37,7 @@ import type {
   SessionSearchCursor as SessionSearchCursorValue,
   SessionSearchPage,
   SessionSearchRequest,
+  SessionResultFilter,
 } from '@deepseek-ai/dsh-session-query'
 import {
   type JournalMode,
@@ -148,7 +150,13 @@ interface PersistenceBinding {
   readonly service?: SessionPersistence
 }
 
+interface LiveRevision {
+  owner: Session
+  metadata: string
+}
+
 interface Observation {
+  liveRevisions: Map<SessionId, LiveRevision>
   persistenceBinding: PersistenceBinding
   persisted: Map<SessionId, ObservedPersistedSession>
   live: Map<SessionId, ObservedSession>
@@ -234,6 +242,9 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _persistenceEpoch = 0
   private _globalGeneration = 0
   private _localGeneration = 0
+  private _persistedRevisions = new Map<SessionId, SessionPersistenceRevision>()
+  private _liveRevisions = new Map<SessionId, LiveRevision>()
+  private readonly _indexedLiveRevisions = new Map<SessionId, LiveRevision>()
   private _tail: Promise<void> = Promise.resolve()
   private _closed = false
   private _closePromise: Promise<void> | undefined
@@ -274,7 +285,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const signal = exec?.signal
     return this._serialized(signal, async () => {
       await this._ensureReady(signal)
-      const persistenceBinding = await this._reconcile(signal)
+      const persistenceBinding = await this._reconcile(signal, normalized.sessionFilters)
       assertNotAborted(signal)
       const generation = String(this._globalGeneration)
       const fingerprint = requestFingerprint(normalized)
@@ -302,7 +313,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     const signal = exec?.signal
     return this._serialized(signal, async () => {
       await this._ensureReady(signal)
-      const persistenceBinding = await this._reconcile(signal)
+      const persistenceBinding = await this._reconcile(signal, [{ kind: 'id', values: [normalized.sessionId] }])
       assertNotAborted(signal)
       const target = this._targetObservation(normalized.sessionId, persistenceBinding)
       const fingerprint = requestFingerprint(normalized)
@@ -404,7 +415,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
   }
 
-  private async _reconcile(signal: AbortSignal | undefined): Promise<PersistenceBinding> {
+  private async _reconcile(signal: AbortSignal | undefined, filters: readonly SessionResultFilter[] = []): Promise<PersistenceBinding> {
     assertNotAborted(signal)
     const db = this._requireDb()
     const persistedRows = db.prepare(
@@ -415,20 +426,35 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     ).all() as unknown as IndexedLiveRow[]
     const persistedById = new Map(persistedRows.map(row => [row.id as SessionId, row]))
     const liveById = new Map(liveRows.map(row => [row.id as SessionId, row]))
-    const observation = await this._observeStable(persistedById, signal)
+    const observation = await this._observeStable(
+      persistedById, signal, filters.filter(filter => filter.kind !== 'availability'),
+    )
     assertNotAborted(signal)
     const persistentChanges = observation.persistenceBinding.service === undefined
       ? []
       : [...observation.persisted.values()].filter(entry => entry.loaded !== undefined)
     const persistentDeletes = observation.persistenceBinding.service === undefined
       ? []
-      : persistedRows.filter(row => !observation.persisted.has(row.id as SessionId))
+      : persistedRows.filter((row) => {
+        const entry = observation.persisted.get(row.id as SessionId)
+        return entry === undefined || (entry.loaded === undefined
+          && (entry.revision !== row.revision
+            || (this._lastPersistenceIdentity !== undefined
+              && this._lastPersistenceIdentity !== observation.persistenceBinding.identity)))
+      })
     const liveChanges = [...observation.live.values()].filter((entry) => {
       const indexed = liveById.get(entry.header.id)
       const persisted = observation.persisted.has(entry.header.id) ? 1 : 0
       return indexed?.fingerprint !== entry.fingerprint || indexed.persisted !== persisted
+        || !sameLiveRevision(this._indexedLiveRevisions.get(entry.header.id), observation.liveRevisions.get(entry.header.id))
     })
-    const liveDeletes = liveRows.filter(row => !observation.live.has(row.id as SessionId))
+    const liveDeletes = liveRows.filter(row => !sameLiveRevision(
+      this._indexedLiveRevisions.get(row.id as SessionId), observation.liveRevisions.get(row.id as SessionId),
+    ))
+    const persistedMetadataChanged = this._persistedRevisions.size !== observation.persisted.size
+      || [...observation.persisted].some(([id, entry]) => this._persistedRevisions.get(id) !== entry.revision)
+    const liveMetadataChanged = this._liveRevisions.size !== observation.liveRevisions.size
+      || [...observation.liveRevisions].some(([id, revision]) => !sameLiveRevision(this._liveRevisions.get(id), revision))
     const pointerChanged = this._lastPersistenceIdentity !== undefined
       && this._lastPersistenceIdentity !== observation.persistenceBinding.identity
     const hasWrites = persistentChanges.length > 0
@@ -485,7 +511,13 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       }
     }
 
-    if (hasWrites || pointerChanged) this._globalGeneration += 1
+    for (const row of liveDeletes) this._indexedLiveRevisions.delete(row.id as SessionId)
+    for (const [id, revision] of observation.liveRevisions) {
+      if (observation.live.has(id)) this._indexedLiveRevisions.set(id, revision)
+    }
+    this._liveRevisions = observation.liveRevisions
+    this._persistedRevisions = new Map([...observation.persisted].map(([id, entry]) => [id, entry.revision]))
+    if (hasWrites || pointerChanged || liveMetadataChanged || persistedMetadataChanged) this._globalGeneration += 1
     if (pointerChanged) this._persistenceEpoch += 1
     this._localGeneration = nextLocalGeneration
     this._lastPersistenceIdentity = observation.persistenceBinding.identity
@@ -495,6 +527,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private async _observeStable(
     indexed: ReadonlyMap<SessionId, IndexedPersistedRow>,
     signal: AbortSignal | undefined,
+    filters: readonly SessionResultFilter[],
   ): Promise<Observation> {
     for (let attempt = 0; attempt < STABLE_OBSERVATION_ATTEMPTS; attempt += 1) {
       assertNotAborted(signal)
@@ -511,6 +544,13 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           assertNotAborted(signal)
           persisted = materializePersistenceSnapshots(before)
           for (const entry of persisted.values()) {
+            const owner = this.ctx.sessions.get(entry.header.id)
+            if (owner !== undefined) assertSessionHeadersCompatible(owner.header, entry.header)
+            if (filterSessionResults([{
+              header: owner?.header ?? entry.header,
+              live: owner !== undefined,
+              persisted: true,
+            }], filters).length === 0) continue
             if (canReuseIndexed && indexed.get(entry.header.id)?.revision === entry.revision) continue
             // Skip work already shadowed by a live owner. The cold read is
             // non-mutating (interrupted turns are balanced in memory only), so
@@ -546,14 +586,22 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         }
       }
       const live = new Map<SessionId, ObservedSession>()
-      for (const session of this.ctx.sessions.list()) {
+      const liveSessions = this.ctx.sessions.list()
+      const liveRevisions = new Map(liveSessions.map(session => [session.id, {
+        owner: session,
+        metadata: JSON.stringify({ header: session.header, seq: session.seq, inheritedEventCount: session.inheritedEventCount }),
+      }]))
+      for (const session of liveSessions) {
+        const durableHeader = persisted.get(session.id)?.header
+        if (durableHeader !== undefined) assertSessionHeadersCompatible(session.header, durableHeader)
+        if (filterSessionResults([{
+          header: session.header, live: true, persisted: persisted.has(session.id),
+        }], filters).length === 0) continue
         const observed = observeLive(session)
-        const durable = persisted.get(session.id)
-        if (durable !== undefined) assertSessionHeadersCompatible(observed.header, durable.header)
         live.set(session.id, observed)
       }
-      if (!sameSessionIds(initiallyLive, live)) continue
-      return { persistenceBinding, persisted, live }
+      if (!sameSessionIds(initiallyLive, new Map(liveSessions.map(session => [session.id, session])))) continue
+      return { persistenceBinding, persisted, live, liveRevisions }
     }
     throw new SessionQueryError(
       'session-search persistence observation did not stabilize after one retry',
@@ -868,6 +916,10 @@ function selectedDocumentsParams(query: string, persistenceVisible: boolean): Ar
   ]
 }
 
+function sameLiveRevision(left: LiveRevision | undefined, right: LiveRevision | undefined): boolean {
+  return left !== undefined && right !== undefined && left.owner === right.owner && left.metadata === right.metadata
+}
+
 function observeLive(session: Session): ObservedSession {
   // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
   return observeSession(session.header, session.inheritedEventCount, session.snapshotEvents())
@@ -926,7 +978,7 @@ function samePersistenceSnapshots(
 
 function sameSessionIds(
   before: ReadonlySet<SessionId>,
-  after: ReadonlyMap<SessionId, ObservedSession>,
+  after: ReadonlyMap<SessionId, unknown>,
 ): boolean {
   if (before.size !== after.size) return false
   for (const id of before) {
